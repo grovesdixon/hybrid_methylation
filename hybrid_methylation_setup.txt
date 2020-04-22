@@ -1,0 +1,103 @@
+#hybrid_methylation_setup.txt
+
+
+########################################
+############## AQUIRE DATA #############
+########################################
+
+
+#------ WGGS data ------#
+#These were submitted 11-Mar-20
+#The GSAF job name was JA20120
+#The GSAF submission sheet is saved as hybrid_methylation/metadata/wgbs_GSAFSampleUpload.xlsx
+#Raw reads are backed up here: /stornext/ranch_01/ranch/users/02260/grovesd/raw_sequence_reads/JA20120.tag.gz
+
+#list your projects
+bs list projects
+bs download project -i 161429268 -o JA20120_download
+mkdir fastqs 
+cd fastqs
+for dir in $(ls -d ../JA20120_download/*)
+do echo "mv $dir/*.gz ."
+done
+
+#SUMMARY:
+	#Job Description: 
+		12 WGBS libraries (Zymo PicomethylSeq Kit):
+		6 libraries for lane1 and 6 libraries for lane2 
+		on single Novaseq S1 PE150 run. 
+		Samples must be run on separate lanes.
+		Intended lane numbers are included in the sample names for clarity.
+	#So we expect 24 total fastq files : (6 lane1 + 6 lane2) * 2 paired-end
+	ls *.fastq | wc -l
+		24
+	ls lane1-*.fastq | wc -l
+		12
+	ls lane2-*.fastq | wc -l
+		12
+
+#=========================#
+
+
+#######################################
+############## RUN FASTQ ##############
+#######################################
+
+#SET UP DIRECTORY WITH SUBSETS FOR QUICK TESTS
+
+NTEST=1000000
+mkdir testRun
+for file in *.fastq
+do head -n $NTEST $file > testRun/${file}
+done
+
+
+#Run FastQC on subsets
+
+module load fastqc
+mkdir Fastqc_Restults_raw/
+> runFQC
+for file in *.fastq
+do echo "fastqc -o Fastqc_Restults_raw/ -f fastq $file" >> runFQC
+done
+
+launcher_creator.py -n runFQC -j runFQC -q development -N 1 -w 24 -a $allo -e $email -t 01:00:00
+sbatch runFQC.slurm
+
+
+
+######################################
+############## TRIMMING ##############
+######################################
+
+#FOR PAIRED END READS
+
+>trimpe
+for file in *_R2_001.fastq
+do R1IN=${file/_R2_001.fastq/}_R1_001.fastq
+R2IN=${file}
+
+echo "cutadapt \
+-a GATCGGAAGAGCA \
+-A GATCGGAAGAGCA \
+-a AGATCGGAAGAGC \
+-A AGATCGGAAGAGC \
+--minimum-length 20 \
+-q 20 \
+-o ${file/_R2_001.fastq/}_R2_001.fastq \
+-p ${file/_2.fastq/}_2.trim \
+${file/_2.fastq/}_1.fastq \
+$file > ${file/_2.fastq/}_trimlog.txt" >> trimpe
+done
+
+
+launcher_creator.py -n trimpe -j trimpe -a $allo -e $email -q normal -t 8:00:00 -N 1 -w 12
+sbatch trimpe.slurm
+
+
+
+
+
+
+
+
