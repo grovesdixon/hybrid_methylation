@@ -76,7 +76,8 @@ sbatch runFQC.slurm
 for file in *_R2_001.fastq
 do R1IN=${file/_R2_001.fastq/}_R1_001.fastq
 R2IN=${file}
-
+R1OUT=${file/_R2_001.fastq/}_1.trim
+R2OUT=${file/_R2_001.fastq/}_2.trim
 echo "cutadapt \
 -a GATCGGAAGAGCA \
 -A GATCGGAAGAGCA \
@@ -84,15 +85,177 @@ echo "cutadapt \
 -A AGATCGGAAGAGC \
 --minimum-length 20 \
 -q 20 \
--o ${file/_R2_001.fastq/}_R2_001.fastq \
--p ${file/_2.fastq/}_2.trim \
-${file/_2.fastq/}_1.fastq \
-$file > ${file/_2.fastq/}_trimlog.txt" >> trimpe
+-o $R1OUT \
+-p $R2OUT \
+$R1IN \
+$R2IN" >> trimpe
 done
 
 
 launcher_creator.py -n trimpe -j trimpe -a $allo -e $email -q normal -t 8:00:00 -N 1 -w 12
 sbatch trimpe.slurm
+
+
+######################################
+########### RUN ON TRIMMED ###########
+######################################
+
+#SET UP DIRECTORY WITH SUBSETS FOR QUICK TESTS
+
+NTEST=1000000
+mkdir testRun
+for file in *.trim
+do head -n $NTEST $file > testRun/${file}
+done
+
+
+#Run FastQC on subsets
+
+module load fastqc
+mkdir Fastqc_Restults_raw/
+> runFQC
+for file in *.trim
+do echo "fastqc -o Fastqc_Restults_raw/ -f fastq $file" >> runFQC
+done
+
+launcher_creator.py -n runFQC -j runFQC -q development -N 1 -w 24 -a $allo -e $email -t 01:00:00
+sbatch runFQC.slurm
+
+
+
+#########################################
+############# SET UP GENOME #############
+#########################################
+
+#we want the lambda genome tacked on there to test the conversion efficiency:
+
+#download lambda genome
+wget https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/840/245/GCF_000840245.1_ViralProj14204/GCF_000840245.1_ViralProj14204_genomic.fna.gz
+
+#stick onto Amil genome and prepare for bismark
+cp ../Amil_Zach_Fullers_v2.00/Amil.v2.00.chrs.fasta ./Amil_lambda.fasta
+sed 's/>NC_001416.1/>lambda_phage/' GCF_000840245.1_ViralProj14204_genomic.fna >> Amil_lambda.fasta
+
+
+#------ RUN BISMARK GENOME PREPARATION ------#
+#set the original lambda genome our of the way in a subdirectly
+mkdir lambda
+mv GCF_000840245.1_ViralProj14204_genomic.fna lambda
+
+#run bismark genome preparation on the folder (make sure Amil_lambda.fasta is the only fasta in this dir)
+GENOME_FOLDER=/work/02260/grovesd/lonestar/Amil_Zach_Fullers_v2.00_ForBismark
+bismark_genome_preparation $GENOME_FOLDER
+
+
+#------- BUILD WINDOW FILES -------#
+GFF=Amil.coding.gff3
+GENOME=Amil_lambda.fasta
+
+#generate gene windows
+gff_to_bed4.py -gff $GFF -feature gene -IDstring ID -o geneBoundaries.bed
+
+#generate exon windows
+gff_to_bed4.py -gff $GFF -feature CDS -IDstring ID -o cdsBoundaries.bed
+
+#generate promoter windows
+gff_to_promoter_bed.py -gff $GFF -bp 1000 -IDstring ID -o promoterBoundaries.bed
+
+#generate for tss windows
+gff_to_tssWindow_bed.py -gff $GFF -bp 250 -IDstring ID -o tssBoundaries.bed
+
+#generate 1Kb windows
+module load bedtools
+fasta_sequence_characters.py -fa $GENOME > chrLengths.txt
+bedtools makewindows -g chrLengths.txt -w 1000 | awk 'BEGIN{OFS="\t"}{print $0,$1"-"$2"-"$3}' > windowBoundaries_1kb.bed
+
+#generate 500 bp windows
+module load bedtools
+fasta_sequence_characters.py -fa $GENOME > chrLengths.txt
+bedtools makewindows -g chrLengths.txt -w 500 | awk 'BEGIN{OFS="\t"}{print $0,$1"-"$2"-"$3}' > windowBoundaries_500bp.bed
+
+#1Kb windows around genes
+windows_around_genes_from_gff.R --i $GFF --o ${GFF}_around_genes_1kb.bed
+
+
+#------- MAKE CALLABLE REFERENCE FILE -------#
+#we end up needing lots of files for the reference genome,
+#so it's easy to assmeble all the paths in a single .sh file,
+#so you can switch to that reference easily from $SCRTACH/
+#(this is helpful when working with multiple species at once)
+
+GENOME_FOLDER=/work/02260/grovesd/lonestar/Amil_Zach_Fullers_v2.00_ForBismark
+echo "\
+GENOME_FOLDER=${GENOME_FOLDER}
+GENOME_PATH=${GENOME_FOLDER}/Amil_lambda.fasta
+GFF_PATH=${GENOME_FOLDER}/Amil.coding.gff3
+GENE_ID=ID
+exonWindowFile=${GENOME_FOLDER}/cdsBoundaries.bed
+geneWindowFile=${GENOME_FOLDER}/geneBoundaries.bed
+promoterWindowFile=${GENOME_FOLDER}/promoterBoundaries.bed
+tssWindowFile=${GENOME_FOLDER}/tssBoundaries.bed
+window1KbFile=${GENOME_FOLDER}/windowBoundaries_1kb.bed
+window500bpFile=${GENOME_FOLDER}/windowBoundaries_500bp.bed
+aroundGeneWindowFile=${GENOME_FOLDER}/Amil.coding.gff3_1kb_around_genes.bed" > /work/02260/grovesd/lonestar/myReferences/amilleporaForBismark.sh
+
+
+########################################
+########### RUNNING BISMARK  ###########
+########################################
+
+
+
+#FIRST SET UP GENOME
+source /work/02260/grovesd/lonestar/myReferences/amilleporaReference.sh
+
+#check
+echo $GENOME_FOLDER
+
+#FOR SINGLE END
+module load bowtie
+module load samtools
+>runBismark
+for file in *.trim.gz
+do echo "bismark --bowtie2 --score_min L,0,-0.6 -N 1 --multicore 6 --non_directional --genome $GENOME_FOLDER $file" >> runBismark
+done
+
+
+#REMOVE DUPLICATES
+module load samtools
+>dedup
+for file in *_bismark_bt2*.bam 
+do echo "deduplicate_bismark --bam $file" >> dedup
+done
+
+launcher_creator.py -n dedupAip -j dedup -q normal -N 3 -w 4 -a $allo -t 12:00:00
+
+#look at results
+grep "Total count of deduplicated leftover sequences" *.deduplication_report.txt
+
+
+#EXTRACT THE METHYLATION RESULTS
+
+#select pe or se
+ENDEDNES="--paired-end"
+ENDEDNES="--single-end"
+
+module load samtools
+>extractMeth
+for file in *_bismark_bt2*.deduplicated.bam 
+do echo "bismark_methylation_extractor --multicore 4 $file $ENDEDNES --merge_non_CpG --scaffolds --comprehensive --cytosine_report --genome_folder $GENOME_FOLDER" >> extractMeth
+done
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

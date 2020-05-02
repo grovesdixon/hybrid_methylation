@@ -1,0 +1,259 @@
+#mapping_experiment.txt
+#goal is to try different Bismark mapping parameters to find optimal mapping strategy
+#to assess how well it's working, we'll look at mapping efficiency, methylation context percentages, and conversion efficiency based on the lambda DNA spike in
+#for more on Bismark see: https://www.bioinformatics.babraham.ac.uk/projects/bismark/
+
+
+
+
+#add variables for launcher_creator.py:
+allo="YOUR_ALLOCATION" #(eg tagmap or mega2014)
+email="YOUR_EMAIL"
+
+#assumes you have the *.trim files assembled in working dir
+ls *.trim
+	lane1-A1-A_S1_L001_1.trim  lane1-A4-D_S4_L001_1.trim  lane2-X2-E_S7_L002_1.trim  lane2-X6-B_S10_L002_1.trim
+	lane1-A1-A_S1_L001_2.trim  lane1-A4-D_S4_L001_2.trim  lane2-X2-E_S7_L002_2.trim  lane2-X6-B_S10_L002_2.trim
+	lane1-A2-B_S2_L001_1.trim  lane1-X1-E_S5_L001_1.trim  lane2-X4-F_S8_L002_1.trim  lane2-X7-C_S11_L002_1.trim
+	lane1-A2-B_S2_L001_2.trim  lane1-X1-E_S5_L001_2.trim  lane2-X4-F_S8_L002_2.trim  lane2-X7-C_S11_L002_2.trim
+	lane1-A3-C_S3_L001_1.trim  lane1-X3-F_S6_L001_1.trim  lane2-X5-A_S9_L002_1.trim  lane2-X8-D_S12_L002_1.trim
+	lane1-A3-C_S3_L001_2.trim  lane1-X3-F_S6_L001_2.trim  lane2-X5-A_S9_L002_2.trim  lane2-X8-D_S12_L002_2.trim
+ls *.trim | wc -l
+	#24 = 12 samples * 2PE fastq files per sample
+	
+	
+#make test sets of 1 million reads (fastqs have 4 lines per read)
+NTEST=4000000
+mkdir sub_fastqs
+for file in *.trim
+do head -n $NTEST $file > sub_fastqs/${file}
+done
+
+
+#######################################
+########### DEFAULT PAIRED ############
+#######################################
+#run bismark with default parameters
+
+
+#make subdir for this mapping experiment and get symbolic links for the subset fastqs
+mkdir default_params
+cd default_params/
+ln -s ../sub_fastqs/*.trim .
+
+
+#ASSIGN THE REFERENCE GENOME
+source /work/02260/grovesd/lonestar/myReferences/amilleporaForBismark.sh
+
+#check
+echo $GENOME_FOLDER
+
+#SET UP BISMARK COMMANDS
+module load bowtie
+module load samtools
+>runBismark
+for file in *_1.trim
+do R1_IN=${file}
+R2_IN=${file/_1.trim/}_2.trim
+echo "bismark --bowtie2 --non_directional --genome $GENOME_FOLDER -1 $R1_IN -2 $R2_IN" >> runBismark
+done
+
+launcher_creator.py -n defaultPaired -n runBismark -q development -N 1 -w 24 -a $allo -e $email -t 02:00:00
+
+
+#REMOVE DUPLICATES
+module load samtools
+>dedup
+for file in *_bismark_bt2*.bam 
+do echo "deduplicate_bismark --bam $file" >> dedup
+done
+
+launcher_creator.py -n dedup -j dedup -q development -N 1 -w 12 -a $allo -t 2:00:00
+
+#look at results
+grep "Total count of deduplicated leftover sequences" *.deduplication_report.txt
+
+
+#EXTRACT THE METHYLATION RESULTS
+
+#select pe or se
+ENDEDNES="--paired-end"
+source /work/02260/grovesd/lonestar/myReferences/amilleporaForBismark.sh
+module load samtools
+>extractMeth
+for file in *_bismark_bt2*.deduplicated.bam 
+do echo "bismark_methylation_extractor $file $ENDEDNES --merge_non_CpG --scaffolds --comprehensive --cytosine_report --genome_folder $GENOME_FOLDER" >> extractMeth
+done
+
+launcher_creator.py -n extractMeth -j extractMeth -q development -N 1 -w 12 -a $allo -t 2:00:00
+
+#GET THE CONVERSION EFFICIENCY BASED ON THE READS MAPPING TO LAMBDA GENOME
+gunzip *.cov.gz
+>all_lambda_cov.tsv
+for file in *.cov
+do echo "${file}..."
+grep "^lambda_phage" $file >> all_lambda_cov.tsv
+done
+
+#get conversion efficiency with hybrid_methylation/wgbs/data_processing_results/plot_processing_results.R
+
+
+#------------ GATHER RESULTS ------------#
+
+#pick whether you did SE or PE to grab results files
+STRAND=PE
+
+#TOTAL READS GOING INTO BISMARK
+>bismark_starting_reads.tsv
+for file in *bismark_bt2_${STRAND}_report.txt
+do count=$(grep "Sequence pairs analysed in total" $file | cut -f 2)
+sample="${file/_1.trim_bismark_bt2_${STRAND}_report.txt/}"
+echo -e "${file}\t${count}\tstartingCount" >> bismark_starting_reads.tsv
+done
+
+
+#TOTAL MAPPED COUNTS
+>bismark_mapped_counts.tsv
+for file in *${STRAND}_report.txt
+do mapped=$(grep "alignments with a unique best" $file | cut -f 2)
+sample="${file/_1.trim_bismark_bt2_${STRAND}_report.txt/}"
+echo -e "${file}\t${mapped}\tmappedCount" >> bismark_mapped_counts.tsv
+done
+
+
+#MAPPING EFFICIENCIES
+>bismark_mapping_efficiencies.txt
+for file in *${STRAND}_report.txt
+do mapeff=$(grep "Mapping efficiency" $file | cut -f 2)
+sample="${file/_1.trim_bismark_bt2_${STRAND}_report.txt/}"
+echo -e "${file}\t${mapeff}\tmappingEfficiency" >> bismark_mapping_efficiencies.txt
+done
+
+
+#METH CONTEXT PERCENTAGES
+echo -e "file\tCpG.pct\tCHG.pct\tCHH.pct\tCN_or_CHH">methylation_context_percentages.txt
+for file in *${STRAND}_report.txt
+do cpg=$(grep "C methylated in CpG context:" $file | cut -f 2)
+chg=$(grep "C methylated in CHG context:" $file | cut -f 2)
+chh=$(grep "C methylated in CHH context:" $file | cut -f 2)
+unkown=$(grep "C methylated in unknown context" $file | cut -f 2)
+sample="${file/_1.trim_bismark_bt2_${STRAND}_report.txt/}"
+echo -e "$file\t$cpg\t$chg\t$chh\t$unknown" >> methylation_context_percentages.txt
+done
+
+#DEDUPLICATED COUNT
+>bismark_dedup_count.txt
+for file in *.deduplication_report.txt
+do count=$(grep "leftover sequences" $file | awk '{print $7}')
+echo -e "${file}\t${count}\tdedupCount" >> bismark_dedup_count.txt
+done
+
+
+#assemble results
+cat bismark_starting_reads.tsv bismark_mapped_counts.tsv bismark_dedup_count.txt > pipeline_counts.txt 
+
+
+
+
+#######################################
+########### DEFAULT SINGLE ############
+#######################################
+
+#make subdir for this mapping experiment and get symbolic links for the subset fastqs
+mkdir default_single
+cd default_params/
+ln -s ../sub_fastqs/*.trim .
+
+
+#ASSIGN THE REFERENCE GENOME
+source /work/02260/grovesd/lonestar/myReferences/amilleporaForBismark.sh
+
+#check
+echo $GENOME_FOLDER
+
+#SET UP BISMARK COMMANDS
+module load bowtie
+module load samtools
+>runBismark
+for file in *.trim.gz
+do echo "bismark --bowtie2 --non_directional --genome $GENOME_FOLDER $file" >> runBismark
+done
+
+
+#REMOVE DUPLICATES
+module load samtools
+>dedup
+for file in *_bismark_bt2*.bam 
+do echo "deduplicate_bismark --bam $file" >> dedup
+done
+
+launcher_creator.py -n dedupAip -j dedup -q development -N 2 -w 6 -a $allo -t 2:00:00
+
+#look at results
+grep "Total count of deduplicated leftover sequences" *.deduplication_report.txt
+
+
+#EXTRACT THE METHYLATION RESULTS
+
+#select pe or se
+ENDEDNES="--single-end"
+
+module load samtools
+>extractMeth
+for file in *_bismark_bt2*.deduplicated.bam 
+do echo "bismark_methylation_extractor --multicore 4 $file $ENDEDNES --merge_non_CpG --scaffolds --comprehensive --cytosine_report --genome_folder $GENOME_FOLDER" >> extractMeth
+done
+
+
+#GET RESULTS AS ABOVE
+
+
+#######################################
+########### RELAXED SINGLE ############
+#######################################
+#here we relax the bowtie2 mapping stringency by setting it to --score_min L,0,-0.6 -N 1
+
+#make subdir for this mapping experiment and get symbolic links for the subset fastqs
+mkdir relaxed_single
+cd default_params/
+ln -s ../sub_fastqs/*.trim .
+
+
+#ASSIGN THE REFERENCE GENOME
+source /work/02260/grovesd/lonestar/myReferences/amilleporaForBismark.sh
+
+#check
+echo $GENOME_FOLDER
+
+#SET UP BISMARK COMMANDS
+module load bowtie
+module load samtools
+>runBismark
+for file in *.trim.gz
+do echo "bismark --bowtie2 --score_min L,0,-0.6 -N 1 --non_directional --genome $GENOME_FOLDER $file" >> runBismark
+done
+
+
+#REMOVE DUPLICATES
+module load samtools
+>dedup
+for file in *_bismark_bt2*.bam 
+do echo "deduplicate_bismark --bam $file" >> dedup
+done
+
+launcher_creator.py -n dedupAip -j dedup -q development -N 2 -w 6 -a $allo -t 2:00:00
+
+#look at results
+grep "Total count of deduplicated leftover sequences" *.deduplication_report.txt
+
+
+#EXTRACT THE METHYLATION RESULTS
+
+#select pe or se
+ENDEDNES="--single-end"
+
+module load samtools
+>extractMeth
+for file in *_bismark_bt2*.deduplicated.bam 
+do echo "bismark_methylation_extractor --multicore 4 $file $ENDEDNES --merge_non_CpG --scaffolds --comprehensive --cytosine_report --genome_folder $GENOME_FOLDER" >> extractMeth
+done
